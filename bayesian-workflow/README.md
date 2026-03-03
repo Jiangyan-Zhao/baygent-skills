@@ -1,0 +1,80 @@
+# bayesian-workflow
+
+An opinionated [Agent Skill](https://agentskills.io) for building, diagnosing, and reporting on Bayesian statistical models using PyMC and ArviZ.
+
+Compatible with Claude Code, Kimi Code, Cursor, Gemini CLI, and any agent that supports the [Agent Skills spec](https://agentskills.io/specification).
+
+## What it does
+
+Guides your coding agent through the full Bayesian workflow:
+
+1. **Formulate** the generative story
+2. **Specify priors** with documented justifications
+3. **Implement in PyMC** using modern best practices (coords, dims, nutpie)
+4. **Prior predictive checks** before fitting
+5. **Inference** via MCMC (nutpie sampler by default)
+6. **Convergence diagnostics** (R-hat, ESS, trace plots, energy plots)
+7. **Model criticism** (posterior predictive checks, LOO-PIT calibration)
+8. **Model comparison** (LOO-CV, ELPD, stacking weights)
+9. **Reporting** with companion analysis notes and audience-adapted reports
+
+The skill enforces guardrails that agents won't apply on their own: 94% HDI (not 95% CI), mandatory calibration checks, non-centered parameterizations for hierarchical models, reproducible descriptive seeds, immediate save-to-disk after sampling, and xarray-first data manipulation.
+
+## Install
+
+### Claude Code
+
+```bash
+claude install-skill https://github.com/Learning-Bayesian-Statistics/baygent-skills/tree/main/bayesian-workflow
+```
+
+### Other compatible agents (Kimi Code, Cursor, etc.)
+
+Copy the `bayesian-workflow/` folder into your agent's skills directory:
+
+```bash
+# Kimi Code
+cp -r bayesian-workflow/ ~/.config/agents/skills/bayesian-workflow/
+
+# Or clone the whole repo and point your agent at it
+git clone https://github.com/Learning-Bayesian-Statistics/baygent-skills.git
+```
+
+### PyMC installation
+
+The skill recommends conda-forge / mamba-forge for PyMC and its dependencies:
+
+```bash
+mamba install -c conda-forge pymc nutpie arviz preliz
+```
+
+## Example prompts
+
+Once installed, just ask your agent naturally:
+
+- *"I have customer churn data with binary outcome plus age, tenure, and monthly spend. Build me a Bayesian logistic regression with uncertainty estimates."*
+- *"My model has 47 divergences and R-hat of 1.03. What do I do?"*
+- *"I have test scores for 200 students across 15 schools. Some schools only have 5 students. Help me build a hierarchical model."*
+- *"Compare these two models and tell me which one to use. I have the InferenceData objects."*
+- *"I need to present Bayesian results to my boss who has no stats background."*
+
+## What's included
+
+```
+bayesian-workflow/
+├── SKILL.md                          # Main workflow instructions (144 lines)
+├── references/
+│   ├── priors.md                     # Prior selection guide
+│   ├── diagnostics.md                # Convergence diagnostics
+│   ├── model-criticism.md            # PPC, calibration, LOO-PIT
+│   ├── model-comparison.md           # LOO-CV, ELPD, stacking weights
+│   ├── hierarchical.md               # Partial pooling, non-centered parameterization
+│   └── reporting.md                  # Report templates, audience adaptation
+└── scripts/
+    ├── diagnose_model.py             # Post-sampling diagnostics report
+    └── calibration_check.py          # Calibration plots from InferenceData
+```
+
+## License
+
+MIT - see [LICENSE](../LICENSE).
