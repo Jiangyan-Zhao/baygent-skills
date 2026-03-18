@@ -4,6 +4,8 @@ An opinionated [Agent Skill](https://agentskills.io) for building, diagnosing, a
 
 Compatible with Claude Code, Kimi Code, Cursor, Gemini CLI, and any agent that supports the [Agent Skills spec](https://agentskills.io/specification).
 
+Full breakdown [here](https://learnbayesstats.com/blog-posts/bayesian-workflow-agent-skill-pymc-arviz).
+
 ## What it does
 
 Guides your coding agent through the full Bayesian workflow:
