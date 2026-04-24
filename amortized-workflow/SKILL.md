@@ -7,8 +7,7 @@ description: >
   BayesFlow, neural posterior estimation, posterior amortization, simulator design, prior design
   for SBI, offline/online simulation pipelines,
   uncertainty quantification from simulators, structured data encoders (sets, time series, images),
-  or mentions of BasicWorkflow, fit_online, fit_offline, fit_disk, FlowMatching, DiffusionModel,
-  StableConsistencyModel, summary networks, adapters, or simulation budgets.
+  or mentions of BasicWorkflow, fit_online, fit_offline, fit_disk, flow matching, diffusion model, consistency model, normalizing flow, summary networks, adapters, or simulation budgets.
 license: MIT
 metadata:
   author:
@@ -24,49 +23,56 @@ metadata:
 Every amortized Bayesian analysis follows this sequence. Do not skip steps — especially simulator validation and model criticism.
 
 1. **Formulate** — Define the generative story. What latent variables or parameters generated the observations?
-2. **Specify the simulator regime** — Decide whether inference will rely on:
-   - **Online training**: simulator available and fast enough to generate data on the fly
-   - **Offline training**: pre-simulated data available and fits in memory
-   - **Disk training**: pre-simulated data available on disk and too large for memory
+2. **Specify the simulator regime** — The first iteration always uses **offline training** for fast turnaround, regardless of simulator speed. The simulator regime only determines the simulation budget for the pilot run:
+   - **Fast simulator** (< 0.05 s per draw): pre-simulate **20 000** datasets, train for **100 epochs**
+   - **Slow simulator** (> 1 s – minutes per draw): pre-simulate **3 000–5 000** datasets, train for **100 epochs**
+   - **No simulator / pre-existing bank**: use whatever is available; switch to **disk training** if it does not fit in memory
+   Online training is a refinement step — use it only after the first offline pass shows healthy diagnostics and you want to squeeze out more performance.
 3. **Define prior + observation model or simulation bank**
-   - If online: implement prior and observation model and wrap them in a simulator
-   - If offline/disk: ensure simulations are already generated from the intended prior and data-generating process or need pre-processing
-4. **Choose the architecture** — this step is critical; getting it wrong silently ruins inference. See `references/conditioning.md` for the full conditioning logic and decision table.
+   - Implement prior and observation model and wrap them in a simulator
+   - Pre-simulate the pilot budget into a dict (using `workflow.simulate(N)`) for offline training
+   - If the simulator is external or proprietary, ensure simulations are already generated from the intended prior and data-generating process
+4. **Choose the architecture** — this step is critical; getting it wrong ruins inference. See `references/conditioning.md` for the full conditioning logic and decision table.
    - **"Simple vector"** means the observation is a **single fixed-length feature vector** whose element order is meaningful (e.g., 5 named sensor readings, a pre-computed summary statistic). Only then: route through `inference_conditions` with no summary network.
-   - **Set-based / exchangeable data** — If the simulator produces **N observations that are exchangeable** (i.e., their joint likelihood is invariant to permutation), the data is a **set**, not a vector. This includes: N i.i.d. draws, regression datasets with (x, y) pairs, repeated measurements, trial-level data, cross-sectional samples. Route through `summary_variables` with a `SetTransformer`. **Never put this in `inference_conditions`.**
+   - **Set-based / exchangeable data** — If the simulator produces **N observations that are exchangeable**, the data is a **set**, not a vector. This includes: N i.i.d. draws, regression datasets with (x, y) pairs, repeated measurements, trial-level data, cross-sectional samples. Route through `summary_variables` with a `SetTransformer`. **Never put this in `inference_conditions`.**
    - **Time series** — ordered sequences: route through `summary_variables` with `TimeSeriesTransformer` or `TimeSeriesNetwork`.
   - **Images as conditions / observations for parameter inference** — route through `summary_variables` with `ConvolutionalNetwork`.
   - **Images as inferential targets** — conditional image generation, spatial field generation, denoising, and other image-valued outputs require an **image-capable diffusion inference network**. Use `bf.networks.DiffusionModel(subnet=...)` with `UNet`, `UViT`, or `ResidualUViT`; see `references/image-generation.md`.
    - **A workflow can use both slots simultaneously.** Fixed-length metadata (e.g., sample size N, scalar design variables) can go in `inference_conditions` while structured observations go in `summary_variables`.
    - **When in doubt, use a summary network.** It is always safer to include one than to omit one; a summary network will always be needed if the data has more than one axis.
 5. **Build the workflow** — Prefer `bf.BasicWorkflow(...)`
-6. **Run simulation sanity checks** — Before training, verify that simulated data look plausible and span the relevant range of real observations
-7. **Train the amortizer**
-   - `workflow.fit_online(...)` if generating on the fly
-   - `workflow.fit_offline(...)` if loading all simulations in memory
+    - Decide on which variables to auto-standardize. Prefer `standardize="all"` unless you have verfied that the simulator outputs are already in a good range for the networks.
+6. **Run simulation sanity checks** — Before training, verify that simulated data look plausible and span the relevant range of real observations. Again, pay attention to what needs to be standardized.
+7. **Train the amortizer** — First iteration always uses offline training for fast feedback:
+   - `workflow.fit_offline(...)` with the pre-simulated pilot budget (default first pass)
+   - `workflow.fit_online(...)` only as a refinement step after offline diagnostics look healthy, or when the user explicitly requests it
    - `workflow.fit_disk(...)` if streaming simulations from disk
+   **Always offer to run training in the terminal** so the user can monitor progress interactively.
 8. **Diagnose in silico** — Use held-out simulations with known ground truth using the workflow's built-in diagnostics: `workflow.compute_default_diagnostics(...)` for numerical results and `workflow.plot_default_diagnostics(...)` for visual diagnostics.
 9. **Amortized inference on real data** — Use `workflow.sample(...)`
 10. **Posterior predictive checks (PPCs)** — Re-simulate data from posterior samples and compare to the real data using model-specific test quantities
-11. **Report results** — Include simulator assumptions, training regime, simulation budget, diagnostic performance, PPC results, and limitations
+11. **Write a report** — Use `references/reporting.md` to generate a structured report outlining results and next steps.
 
 ## Hard rules — MUST and NEVER
 
 These rules are non-negotiable. Violating any of them will silently produce wrong results.
 
-- **MUST use `bf.Adapter()` for data routing.** Build an explicit adapter chain with `.as_set()`, `.constrain()`, `.concatenate()`, etc. and pass `adapter=` to `BasicWorkflow`. Do NOT invent custom adapter functions, lambdas, or manual preprocessing — the adapter handles training and inference identically. The naming shorthand (`inference_variables=`, `summary_variables=` as kwargs) is ONLY acceptable when the simulator output already has the exact shapes/dtypes the networks expect AND no parameter has bounded support. When in doubt, use an explicit adapter.
-- **MUST start with the Small network configuration** from `references/model-sizes.md`. Scale up to Base or Large ONLY if diagnostics show poor recovery or calibration after sufficient training. Oversized networks waste compute and can hurt calibration on simple problems.
-- **MUST use `workflow.simulate(N)` to generate test data** for diagnostics — not a Python for-loop over `simulator()`. The simulator returned by `bf.make_simulator` is a batched object; `workflow.simulate(N)` calls it efficiently and returns data in the format the workflow expects.
+- **MUST use `bf.Adapter()` for data routing.** Build an explicit adapter chain with `.as_set()`, `.constrain()`, `.concatenate()`, etc. and pass `adapter=` to `BasicWorkflow`, as described in `references/adapter.md`. Do NOT do manual preprocessing — the adapter handles training and inference identically. The naming shorthand (`inference_variables=`, `summary_variables=` as kwargs to `BasicWorkflow`) is ONLY acceptable when the simulator output already has the exact shapes/dtypes the networks expect AND no parameter has bounded support. When in doubt, use an explicit adapter.
+- **MUST start with the Base network configuration** from `references/model-sizes.md`. Scale up to Large or XL ONLY if diagnostics show poor recovery or calibration after sufficient training. Oversized networks waste compute and can hurt calibration on simple problems.
+- **MUST use `workflow.simulate(N)` to generate train/test data** — not a Python for-loop over `simulator()`. The simulator returned by `bf.make_simulator` is a batched object; `workflow.simulate(N)` calls it efficiently and returns data in the format the workflow expects.
 - **MUST use `workflow.compute_default_diagnostics(test_data=...)` and `workflow.plot_default_diagnostics(test_data=...)`** for in-silico diagnostics. NEVER hand-roll coverage, bias, or calibration computations — the built-in methods are correct, complete, and consistent with the house thresholds.
-- **For image-valued inference targets, follow `references/image-generation.md`.** MUST use `bf.networks.DiffusionModel(subnet=...)` with `UNet`, `UViT`, or `ResidualUViT` — not the default low-dimensional setup. Conditions must be spatially concatenable with the image target (broadcast `(B, D)` to `(B, H, W, D)`). `scripts/check_diagnostics.py` does not apply; use visual sample grids instead.
+- **For image-valued inference targets, follow `references/image-generation.md`.** MUST use `bf.networks.DiffusionModel(subnet=...)` with `UNet`, `UViT`, or `ResidualUViT` — not the default low-dimensional setup. Conditions must be spatially concatenable with the image target (broadcast `(B, D)` to `(B, H, W, D)`). The standard diagnostic report does not apply; use visual sample grids instead.
 - **`workflow.sample()` returns original parameter names, NOT `"inference_variables"`.** The adapter's reverse transform restores the original keys from the simulator (e.g., `"alpha"`, `"beta"`, `"sigma"`). Each parameter has shape `(batch, num_samples)` for scalars or `(batch, num_samples, d)` for vectors. NEVER index into `"inference_variables"` — that key does not exist in the output.
 - **MUST reuse the existing simulator functions for PPCs.** NEVER re-implement the generative model by hand for posterior predictive checks. Loop over a subset of posterior draws (50 is a good default), indexing over the `num_samples` axis, and pass each draw through the simulator's forward model.
 - **MUST save `history.history` as JSON** (not CSV, not a DataFrame — it is a plain dict). Then run `scripts/inspect_training.py` or call `inspect_history()` in-process.
-- **MUST pass `validation_data=` to all `fit_*` calls.** Use an integer (e.g., `validation_data=300`) for online training.
+- **MUST pass `validation_data=` to all `fit_*` calls.** For offline training, hold out ~300 simulations as a separate validation dict. For online training (refinement step only), pass an integer (e.g., `validation_data=300`) to auto-simulate.
 - **NEVER mix an explicit `adapter=` with the naming shorthand** (`inference_variables=`, `summary_variables=`, `inference_conditions=` as kwargs). They are mutually exclusive. Passing both causes silent conflicts.
 - **NEVER flatten structured data into `inference_conditions`.** Sets, time series, and images MUST go through `summary_variables` with an appropriate summary network.
 - **`workflow.plot_default_diagnostics()` ALWAYS returns a `dict[str, Figure]`.** Iterate directly over `.items()` to save figures. Do not type-check or branch on the return type.
 - **NEVER skip in-silico diagnostics.** Good training loss does not imply good inference.
+- **MUST generate `report.md` after every training + diagnostics run.** Store all artifacts in `<slug>/` (see `references/reporting.md` for naming and structure). Save all diagnostic figures with their standard names, save `metrics.csv`, and produce a self-contained markdown diagnostic report. If real data is available, include the optional real-data sections in the same report. For image-valued targets, skip the standard report and use visual sample grids instead.
+- **NEVER use `fit_online` as the first training pass** unless the user explicitly requests it. The first iteration MUST use `fit_offline` with a pre-simulated pilot budget (10k sims for fast simulators, 3k–5k for slow ones) to maximize iteration speed. Online training is a refinement step for subsequent iterations.
+- **MUST offer to run training in the terminal** so the user can monitor progress. Training scripts should be runnable standalone; do not silently execute long training runs without giving the user access to the live output.
 
 ## Installation
 
@@ -82,11 +88,8 @@ pip install "bayesflow"
 import bayesflow as bf
 import numpy as np
 
-RANDOM_SEED = sum(map(ord, "my-sbi-analysis-v1"))
-rng = np.random.default_rng(RANDOM_SEED)
-
 # --------------------------------------------------
-# 1. Define prior + observation model (online case)
+# 1. Define prior + observation model
 # --------------------------------------------------
 
 def my_prior():
@@ -105,23 +108,19 @@ simulator = bf.make_simulator([my_prior, my_observation_model])
 # 2. Choose architecture
 # --------------------------------------------------
 
-# IMPORTANT: Choose summary network based on data structure.
-# - None ONLY if the observation is a single fixed-length vector with meaningful element order.
-# - SetTransformer if the data consists of N exchangeable observations (e.g., i.i.d. draws,
-#   regression datasets, repeated measurements). This is the MOST COMMON case.
-# - TimeSeriesTransformer / TimeSeriesNetwork for ordered sequences.
-# - ConvolutionalNetwork for image data when the IMAGE is the condition / observation and the target is low-dimensional.
-# - If the TARGET itself is an image or spatial field, switch to the image-generation workflow in
-#   references/image-generation.md and use DiffusionModel(subnet=UNet/UViT/ResidualUViT).
-#
-# ALWAYS start with the SMALL config from references/model-sizes.md. Scale up only if diagnostics
-# show poor recovery or calibration after sufficient training.
-summary_net = bf.networks.SetTransformer(...)  # see references/model-sizes.md — start with Small
+# See references/conditioning.md for the full conditioning logic and decision table.
 
-inference_net = bf.networks.FlowMatching()
+# See references/model-sizes.md for different configurations — always start with Base.
+
+# Example summary network for set-based data (exchangeable observations):
+summary_net = bf.networks.SetTransformer(...) 
+
+
+inference_net = bf.networks.FlowMatching(...)
 # alternatives:
-# bf.networks.DiffusionModel()
-# bf.networks.StableConsistencyModel()   # when fast inference is especially important
+# bf.networks.StableConsistencyModel() # faster sampler, less performant
+# bf.networks.DiffusionModel() # slower sampler, good for image generation
+# bf.networks.CouplingFlow(depth=4, transform="spline") # good-old normalizing flow
 
 # --------------------------------------------------
 # 3. Build the adapter (MUST use bf.Adapter)
@@ -130,9 +129,6 @@ inference_net = bf.networks.FlowMatching()
 # See references/adapter.md for the full API and a step-by-step example.
 # The adapter routes simulator output to the correct network slots and handles
 # parameter constraints, set assembly, dtype conversion, and concatenation.
-#
-# NEVER mix adapter= with naming kwargs (inference_variables=, summary_variables=, etc.).
-# NEVER write a custom adapter function — always use the bf.Adapter() chain.
 adapter = (
     bf.Adapter()
     .as_set(["observables"])              # (N,) -> (N, 1) for SetTransformer
@@ -143,34 +139,56 @@ adapter = (
 )
 
 # --------------------------------------------------
-# 4. Create workflow
+# 4. Create results folder and workflow
 # --------------------------------------------------
+
+import os
+
+results_dir = "<slug>"  # e.g., "churn-model" or "churn-model-v2" for iterations
+os.makedirs(results_dir, exist_ok=True)
 
 workflow = bf.BasicWorkflow(
     simulator=simulator,
     inference_network=inference_net,
     summary_network=summary_net,
     adapter=adapter,
-    checkpoint_filepath="checkpoints",
-    checkpoint_name="your_model",
+    checkpoint_filepath=results_dir,
 )
 
 # --------------------------------------------------
-# 5. Train (use deep learning best practices)
+# 5. Pre-simulate pilot budget (ALWAYS offline first)
+# --------------------------------------------------
+# First iteration: pre-simulate a fixed budget for fast turnaround.
+# - Fast simulator (< 0.05 s/draw): 20 000 datasets
+# - Slow simulator (1 s+ /draw): 3 000–5 000 datasets
+# Online training is a REFINEMENT step — only use it after offline
+# diagnostics are healthy and you want to squeeze out more performance.
+
+N_PILOT = 20_000  # adjust down for slow simulators
+N_VAL = 300
+
+all_sims = workflow.simulate(N_PILOT + N_VAL)
+
+# Split into training and validation sets
+train_data = {k: v[:N_PILOT] for k, v in all_sims.items()}
+val_data = {k: v[N_PILOT:] for k, v in all_sims.items()}
+
+# --------------------------------------------------
+# 6. Train (offline first — fast iteration)
 # --------------------------------------------------
 
-history = workflow.fit_online(
-    epochs=500,
+history = workflow.fit_offline(
+    data=train_data,
+    epochs=100, # typically between 100 and 300
     batch_size=32,
-    num_batches_per_epoch=100,
-    validation_data=300,  # auto-simulates 300 validation sets
+    validation_data=val_data,
 )
 
 # --- Mandatory: save history and inspect training convergence ---
 import json
 from scripts.inspect_training import inspect_history
 
-with open("history.json", "w") as f:
+with open(os.path.join(results_dir, "history.json"), "w") as f:
     json.dump(history.history, f)
 
 training_report = inspect_history(history.history)
@@ -182,36 +200,46 @@ if not training_report["overall"]["ok"]:
         print(f"  - {issue}")
 
 # --------------------------------------------------
-# 6. In-silico diagnostics on held-out simulations
+# 7. In-silico diagnostics and reporting
 # --------------------------------------------------
 
-# MUST use workflow.simulate() — NEVER loop over simulator() manually.
-# MUST use the built-in diagnostics — NEVER hand-roll coverage/bias/calibration.
 test_data = workflow.simulate(300)
 
-# plot_default_diagnostics ALWAYS returns a dict[str, Figure].
-# No need to type-check — iterate directly.
+# --- Save diagnostic figures (standard names from references/reporting.md) ---
+import matplotlib.pyplot as plt
+
 figures = workflow.plot_default_diagnostics(test_data=test_data)
-for name, fig in figures.items():
-    fig.savefig(f"diagnostics_{name}.png", dpi=150, bbox_inches="tight")
+figure_names = {
+    "losses": "loss.png",
+    "recovery": "recovery.png",
+    "calibration_ecdf": "calibration_ecdf.png",
+    "coverage": "coverage.png",
+    "z_score_contraction": "z_score_contraction.png",
+}
+for key, fig in figures.items():
+    fig.savefig(os.path.join(results_dir, figure_names[key]), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+# --- Save numerical diagnostics ---
 metrics = workflow.compute_default_diagnostics(test_data=test_data, as_data_frame=True)
-
-# --- Mandatory: save diagnostics and check house thresholds ---
-from scripts.check_diagnostics import check_diagnostics
-
-metrics.to_csv("metrics.csv")
+metrics.to_csv(os.path.join(results_dir, "metrics.csv"))
 print(metrics)
 
-diag_report = check_diagnostics(metrics)
-print(json.dumps(diag_report, indent=2))
+# --- Assess and generate report ---
+from scripts.check_diagnostics import check_diagnostics, suggest_next_steps
 
-if diag_report["overall"]["decision"] == "STOP":
-    raise RuntimeError(diag_report["overall"]["recommendation"])
+diag_report = check_diagnostics(metrics)
+next_steps = suggest_next_steps(training_report, diag_report)
+
+# Generate results_dir/report.md following the template in references/reporting.md.
+# Use training_report for the Convergence assessment.
+# Use diag_report["summary"] for the Recovery, Calibration, Contraction,
+# and Numerical Summary assessments (plain-language ratings per parameter).
+# Use next_steps for the Suggested Next Steps section.
+# If real data is available, also include the optional real-data sections.
 
 # --------------------------------------------------
-# 7. Amortized inference on real data (if any)
+# 8. Amortized inference on real data (if any)
 # --------------------------------------------------
 
 # The adapter is applied in REVERSE after sampling: the returned dict
@@ -228,7 +256,7 @@ samples = workflow.sample(
 #      samples["beta"].shape  == (1, 1000, 1)
 
 # --------------------------------------------------
-# 8. Posterior predictive checks (custom)
+# 9. Posterior predictive checks (custom)
 # --------------------------------------------------
 
 # MUST reuse the existing simulator functions for PPCs.
@@ -245,27 +273,23 @@ samples = workflow.sample(
 #     # Compare x_rep to x_obs using domain-specific summaries
 ```
 
-## Offline and disk training
+## Online training (refinement step)
 
-Only **online training** requires a callable simulator.
-
-If the simulator is slow, unavailable, proprietary, or external, BayesFlow can still be trained from simulations alone.
-
-### Offline training
+Online training generates fresh simulations on the fly during training. **Use it only after the first offline pass shows healthy diagnostics** and you want to squeeze out additional performance with a larger effective simulation budget. It is also the natural choice when the user explicitly requests it.
 
 ```python
-workflow = bf.BasicWorkflow(
-    inference_network=bf.networks.FlowMatching(),
-    summary_network=summary_net,
-    inference_variables=["parameters"],
-    summary_variables=["observables"],  # NOT inference_conditions — structured data needs a summary network
-    ...
+# Refinement: switch to online training after successful offline iteration
+history = workflow.fit_online(
+    epochs=200,
+    batch_size=32,
+    num_batches_per_epoch=100,
+    validation_data=300,
 )
-
-history = workflow.fit_offline(data=simulated_data, epochs=500, batch_size=32, validation_data=validation_data)
 ```
 
-### Disk training
+## Disk training
+
+Use disk training when the simulation bank is too large for memory.
 
 ```python
 def custom_load(path_to_file):
@@ -274,15 +298,19 @@ def custom_load(path_to_file):
 
 
 workflow = bf.BasicWorkflow(
-    inference_network=bf.networks.FlowMatching(),
+    inference_network=bf.networks.FlowMatching(...),
     summary_network=summary_net,
     inference_variables=["parameters"],
-    summary_variables=["observables"],  # NOT inference_conditions — structured data needs a summary network
+    summary_variables=["observables"],
     ...
 )
 
-history = workflow.fit_disk(root="path/to/simulation_bank", load_fn=custom_load, epochs=500, batch_size=32, validation_data=validation_data)
+history = workflow.fit_disk(root="path/to/simulation_bank", load_fn=custom_load, epochs=100, batch_size=32, validation_data=validation_data)
 ```
+
+## Augmentations
+
+See `references/augmentations.md` for a guide on applying optional transformations during training.
 
 ## Architecture defaults
 
@@ -290,7 +318,7 @@ history = workflow.fit_disk(root="path/to/simulation_bank", load_fn=custom_load,
 
 See `references/adapter.md` for the full adapter API and a step-by-step example.
 
-When `BasicWorkflow` receives `inference_variables=`, `summary_variables=`, etc. as keyword arguments, it constructs a **minimal implicit adapter** that only renames and routes those keys. This is sufficient when the simulator output already has the right shapes and dtypes. Use an explicit `bf.Adapter()` chain and pass `adapter=` to the workflow whenever you need structural transforms (`.as_set`, `.broadcast`), parameter constraints (`.constrain`), feature engineering (`.sqrt`, `.log`), dtype coercion (`.convert_dtype`), or custom concatenation. The explicit adapter and the naming shorthand are mutually exclusive — do not use both.
+When `BasicWorkflow` receives `inference_variables=`, `summary_variables=`, etc. as keyword arguments, it constructs a **minimal implicit adapter** that only renames and routes those keys. This is sufficient when the simulator output already has the right shapes and dtypes. Use an explicit `bf.Adapter()` chain and pass `adapter=` to the workflow whenever you need structural transforms (`.as_set`, `as_time_series`, `.broadcast`), parameter constraints (`.constrain`), feature engineering (`.sqrt`, `.log`), dtype coercion (`.convert_dtype`), or custom concatenation. The explicit adapter and the naming shorthand are mutually exclusive — do not use both.
 
 ### Summary networks
 
@@ -315,11 +343,10 @@ As a heuristic, always start by setting the `summary_dim` argument to 2x the num
 
 For most posterior approximation tasks, default to one of:
 
-- `bf.networks.FlowMatching()`
-- `bf.networks.DiffusionModel()`
-- `bf.networks.StableConsistencyModel()`
-
-Use **StableConsistencyModel** when very fast posterior sampling at deployment time is especially important.
+- `bf.networks.FlowMatching()` - multi-step sampling, recommended for a first iteration
+- `bf.networks.DiffusionModel()` - multi-step sampling, recommended for high-dimensional targets
+- `bf.networks.StableConsistencyModel()` - few-step sampling, less performant, can lose information
+- `bf.networks.CouplingFlow()` - single-step sampling, recommended if very fast inference is important
 
 ### Image-valued inference targets
 
@@ -359,111 +386,49 @@ After training, always:
    from scripts.inspect_training import inspect_history
    report = inspect_history(history.history)
    ```
-3. The script checks for: NaN in losses, overfitting (val_loss ratio > 1.5×), under-training (loss still decreasing), and prints a JSON report with go/no-go recommendation.
+3. The script checks for: NaN in losses, overfitting (val_loss ratio > 1.1×), under-training (loss still decreasing), and prints a JSON report with go/no-go recommendation.
 
 ### Controlling terminal output
 
-All `fit_*` methods pass `**kwargs` through to Keras `model.fit()`. Use `verbose=1` (default) for progress bars, `verbose=2` for one line per epoch, or `verbose=0` to suppress output. In non-interactive environments (e.g., scripts piped to a file), prefer `verbose=2`.
+All `fit_*` methods pass `**kwargs` through to Keras `model.fit()`. Use `verbose=1` (default) for progress bars, `verbose=2` for one line per epoch, or `verbose=0` to suppress output. Prefer `verbose=1` and remind the user to focus the terminal to follow how the script progresses.
 
-## Diagnostics gate
+## Diagnostics and reporting
 
-This section applies to **low-dimensional inferential targets** such as scalar or vector parameters. For image-valued targets, do **not** use `scripts/check_diagnostics.py`; instead, save visual diagnostics and inspect a small grid of generated samples from held-out conditions.
-
-After computing diagnostics with `workflow.compute_default_diagnostics(test_data=..., as_data_frame=True)`, you **must** perform the following steps. Do not skip any of them.
-
-### Always save and check diagnostics
-
-The returned DataFrame has metric names as rows (`RMSE`, `Log-gamma`, `ECE`, `Post. Contraction`) and parameter names as columns.
-
-After computing diagnostics, always:
-
-1. **Print the full DataFrame** so values are visible in the output.
-2. **Save the DataFrame** to CSV:
-   ```python
-   metrics.to_csv("metrics.csv")
-   ```
-3. **Run `scripts/check_diagnostics.py`** to get a structured pass/fail report:
-   ```bash
-   python scripts/check_diagnostics.py --metrics metrics.csv
-   ```
-   Or call it in-process:
-   ```python
-   from scripts.check_diagnostics import check_diagnostics
-   report = check_diagnostics(metrics)
-   ```
-4. The script checks each parameter against house thresholds and returns a JSON report with a `GO`, `WARN`, or `STOP` decision.
-
-### Go / no-go decision
-
-- If **any parameter** has `ECE > 0.10` or `NRMSE > 0.15`: **stop**. Do not proceed to real-data inference. Diagnose and fix first (see "When things go wrong" table).
-- If **any parameter** has `ECE > 0.05` or `NRMSE > 0.10`: **warn** the user and proceed only if they accept the risk.
-- If contraction is `< 0.80` for parameters expected to be identifiable: **warn** — the data may not be informative for those parameters, or the summary network may need more capacity.
-- If contraction is `> 0.99` with `ECE > 0.05`: **stop** — the posterior is overconfident and miscalibrated.
+After every training + diagnostics run, you **must** generate a self-contained diagnostic report. See `references/reporting.md` for the full template.
 
 ## Scripts
 
 | Script | Purpose | Input | Output |
 |--------|---------|-------|--------|
 | `scripts/inspect_training.py` | Check training convergence | `--history history.json` | JSON report: NaN, overfitting, under-training |
-| `scripts/check_diagnostics.py` | Check diagnostics against house thresholds | `--metrics metrics.csv` | JSON report: per-parameter GO/WARN/STOP |
+| `scripts/check_diagnostics.py` | Produce qualitative per-parameter assessments for the report | `--metrics metrics.csv [--history history.json]` | JSON: per-parameter ratings (calibration, recovery, contraction) + summary + next steps |
 
-Both scripts can be run from the command line or imported as Python modules (see template above).
+Both scripts can be run from the command line or imported as Python modules:
 
-## Additional rules
+```python
+from scripts.inspect_training import inspect_history
+from scripts.check_diagnostics import check_diagnostics, suggest_next_steps
 
-- **Only online training requires a simulator.** Offline and disk workflows only require simulated pairs from the correct generative process.
-- **Always keep preprocessing identical between training and inference.** Any transformation applied to simulations must also be applied to real data.
-- **Do not interpret posteriors from poor diagnostics.** A sharp posterior can still be badly calibrated and vice versa.
-- **Save checkpoints during training.** Neural posterior training can take time; preserve usable models and diagnostics.
-- **Document the simulation budget.** Report how many simulations, which prior, and which training mode were used.
-- **Report uncertainty with samples, not only point estimates.** BayesFlow gives approximate posterior draws — use them.
+training_report = inspect_history(history.history)
+diag_report = check_diagnostics(metrics)
+next_steps = suggest_next_steps(training_report, diag_report)
+```
 
 ## Diagnostic interpretation
 
-Use `workflow.compute_default_diagnostics(...)` as the **primary** diagnostic interface. Use `workflow.plot_default_diagnostics(...)` only as supporting visual evidence.
+Use `workflow.compute_default_diagnostics(...)` as the **primary** diagnostic interface. Use `workflow.plot_default_diagnostics(...)` as supporting visual evidence for the report.
 
-Prioritize these **numerical diagnostics**:
+`check_diagnostics()` converts numeric diagnostics into qualitative per-parameter ratings:
 
-1. **Calibration**
-   - Good posteriors should be well-calibrated on held-out simulations
-   - Use **expected calibration error (ECE)** as the main scalar summary
+- **calibration** — rated from ECE: `excellent`, `fair`, or `poor`
+- **recovery** — rated from NRMSE: `excellent`, `good`, `fair`, or `poor`
+- **contraction** — rated from posterior contraction: `high`, `medium`, `low`, or `poor — overconfident` (high contraction + poor calibration)
 
-2. **Recovery / estimation error**
-   - Posterior summaries should ideally recover the known generating parameters across the test bank
-   - Use **NRMSE** as the main scalar summary
-
-3. **Posterior contraction**
-   - The posterior should contract meaningfully relative to the prior when the data are informative
-   - Use **posterior contraction** as the main uncertainty-reduction summary
-
-Treat the following plots as **secondary diagnostics** that help explain failures, not as the primary acceptance criteria:
-
-- **Coverage** for calibration
-- **Recovery** for point-estimation behavior
-- **z-score / contraction** for sensitivity and uncertainty reduction
-
-### House thresholds
-
-These are pragmatic workflow guardrails, not library defaults.
-
-- **ECE**
-  - `< 0.05` excellent
-  - `0.05 – 0.10` acceptable
-  - `> 0.10` problematic
-
-- **Posterior contraction**
-  - `< 0.80` weak information gain
-  - `0.80 – 0.95` good
-  - `0.95 – 0.99` excellent if calibration remains good
-  - `> 0.99` inspect for possible over-concentration or train/test mismatch
-
-- **NRMSE**
-  - `< 0.05` good
-  - `0.05 – 0.10` acceptable
-  - `0.10 – 0.15` weak
-  - `> 0.15` poor
+The output also includes a plain-language `summary` per parameter (e.g., `"excellent calibration; good recovery; high contraction"`) ready to paste into the report.
 
 If diagnostics disagree, trust **calibration** first. A narrow but miscalibrated posterior is worse than a wider calibrated one.
+
+Numeric thresholds are internal to `check_diagnostics()` — do not expose them in the report. Use only the qualitative ratings.
 
 ## Posterior predictive checks
 
@@ -489,53 +454,17 @@ General recipe:
    - temporal or spatial structure
 4. If replicated data systematically miss the observed data, improve the simulator before trusting inference
 
-## Common gotchas
-
-- **Using online training with a slow simulator** — switch to offline or disk training
-- **Training on simulations from the wrong prior** — networks may not generalize well to real data
-- **Using train simulations for diagnostics** — gives over-optimistic results
-- **Ignoring preprocessing mismatch** — real-data inference breaks silently if scaling/formatting differs from training
-- **Flattening structured data** — wastes inductive bias and usually hurts calibration. The most common mistake is treating N exchangeable 1D observations as a flat vector instead of turning them into a `(N, 1)` set and using a SetTransformer
-- **Interpreting loss as inferential quality** — low loss does not guarantee good posterior estimation
-- **Skipping PPCs** — good in-silico recovery does not guarantee the simulator explains the real data
-- **Over-trusting contraction** — strong contraction without calibration can mean overconfidence
-- **No checkpointing** — long training runs should always save intermediate weights
-
 ## When things go wrong
 
 | Symptom                          | Likely Cause                                              | Fix                                                                 |
 |-----------------------------------|-----------------------------------------------------------|---------------------------------------------------------------------|
-| Loss becomes NAN                       | Simulator outputs contain inf/nan or large values         | Inspect simulator outputs; if nan/inf, explore root cause; if large values, ensure everything is standardized in the workflow (e.g., divide by 255 for images) |
-| Recovery good / Calibration bad   | Network is underexpressive or training is too short       | Train for twice the number of epochs; if not fixed, increase summary capacity by a factor of 2 (adjust model sizes as needed) |
+| Loss becomes NAN                       | Simulator outputs contain inf/nan or large values         | Inspect simulator outputs; if nan/inf, explore root cause; if large values, ensure workflow uses the proper `standardize` flag or the simulator normalizes outputs (e.g., divide by 255 for images) |
+| Recovery good / Calibration bad   | Networks are underexpressive or training is too short       | Train for twice the number of epochs; if not fixed, increase summary capacity to Large |
 | Recovery bad / Calibration good  | Some parameters are non-identifiable or same issue as bad recovery | Increase network capacity by two and train for twice as long; if no improvement, parameters may be non-identifiable |
-| Nans/inf in samples on real data  | Real data preprocessed differently, contains outliers, or model mis-specified | Look at scale of real data; prompt user to test for outliers; check for potential model mis-specification |
-| Online training is slow           | Batch size or simulator calls take too long               | Switch to offline training or speed up the simulator |
+| Nans/inf in samples on real data  | Real data preprocessed differently, contains outliers, or model misspecified | Look at scale of real data; prompt user to test for outliers; check for potential model mis-specification |
+| Online training is slow           | Batch size or simulator calls take too long               | Switch to offline /disk training or speed up the simulator |
+| Training loss improves but val_loss stays worse or diverges | Overfitting / small simulation budget / excessive capacity | simulate more data, if possible, add `dropout=0.1` or even `dropout=0.2` in `subnet_kwargs` for the inference net and to the init of the summary net (if any); retrain and re-check diagnostics |
 
 ## Model sizes
 
-Always check `references/model-sizes.md` for rules on model sizes when choosing a summary backbone and an inference network for a particular problem.
-
-## Reporting template
-
-Always report:
-
-- inferential targets, conditions (data) and associated dimensionalities
-- simulator description
-- prior specification
-- training mode: online / offline / disk
-- simulation budget
-- architecture:
-  - summary network (if present)
-  - inference network
-- held-out diagnostic results
-- posterior predictive checks (if real data present)
-- limitations and likely simulator misspecifications
-
-When the user asks for a report or mentions a non-technical audience, produce a **standalone markdown report file** explaining:
-
-- what BayesFlow learned
-- what the diagnostics say
-- whether the posterior seems calibrated
-- whether the model reproduces the observed data
-- what remains uncertain
-- suggested next steps
+Always check `references/model-sizes.md` for rules on model sizes when choosing a summary backbone and an inference net for a particular problem.
